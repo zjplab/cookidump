@@ -91,20 +91,33 @@ def run(webdriverfile, outputdir, separate_json):
     """Scraps all recipes and stores them in html"""
     print('[CD] Welcome to cookidump, starting things off...')
     # fixing the outputdir parameter, if needed
-    if outputdir[-1:][0] != '/': outputdir += '/'
-    locale = str(input('[CD] Complete the website domain: https://cookidoo.'))
-    baseURL = 'https://cookidoo.{}/'.format(locale)
+    if outputdir[-1:][0] != '/':
+        outputdir += '/'
+
+    # ------------------------------------------------------------------
+    # HARDCODED TARGET URL (Chinese Cookidoo search page)
+    # ------------------------------------------------------------------
+    searchURL = 'https://cookidoo.com.cn/search/zh-Hans-CN?languages=zh'
+
+    # derive root domain & language code for later use (logout, etc.)
+    parsed_url = urlparse(searchURL)
+    rootURL = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    language_code = 'zh-Hans-CN'
+
     brw = startBrowser(webdriverfile)
-    # opening the home page
-    brw.get(baseURL)
+
+    # open search page directly – user can log in from there
+    brw.get(searchURL)
     time.sleep(PAGELOAD_TO)
-    reply = input('[CD] Please login to your account and then enter y to continue: ')
-    # recipes base url
-    rbURL = 'https://cookidoo.{}/search/'.format(locale)
+    input('[CD] 请登录 Cookidoo 账户后，在终端输入 y 继续 (login then type y): ')
+    # recipes base url (supports optional language code suffix)
+    rbURL = f"{rootURL}/search/"
+    if language_code:
+        rbURL += f"{language_code}/"
     brw.get(rbURL)
     time.sleep(PAGELOAD_TO)
     # possible filters done here
-    reply = input('[CD] Set your filters, if any, and then enter y to continue: ')
+    input('[CD] 如需筛选，请在浏览器页面设置后，在终端输入 y 继续 (set filters if desired then type y): ')
     # asking for additional details for output organization
     custom_output_dir = input("[CD] enter the directory name to store the results (ex. vegeratian): ")
     if custom_output_dir : outputdir += '{}/'.format(custom_output_dir)
@@ -116,27 +129,71 @@ def run(webdriverfile, outputdir, separate_json):
     try: brw.find_element(By.CLASS_NAME, 'accept-cookie-container').click()
     except: pass
     # showing all recipes
-    elementsToBeFound = int(brw.find_element(By.CLASS_NAME, 'items-start').text.split('\n')[-1].split(' ')[0])
+    # Try to retrieve the total amount of recipes reported by the site. If the markup
+    # changes (again) and we cannot find it, just set a very large number so that the
+    # scrolling logic relies on the "no-new-elements" heuristic instead.
+    import re as _re  # local import to avoid issues if re not imported globally
+    try:
+        stats_text = brw.find_element(By.CLASS_NAME, 'items-start').text
+        elements_match = _re.search(r'\d+', stats_text.replace(',', ''))
+        elementsToBeFound = int(elements_match.group()) if elements_match else 10**9
+    except Exception:
+        elementsToBeFound = 10**9  # fallback when result counter cannot be located
+
     previousElements = 0
+    retry_counter = 0
+
     while True:
-        # checking if ended or not
         currentElements = len(brw.find_elements(By.CLASS_NAME, 'link--alt'))
-        if currentElements >= elementsToBeFound: break
-        # scrolling to the end
+
+        # stop if we have reached (or overflowed) the expected amount of elements
+        if currentElements >= elementsToBeFound:
+            break
+
+        # scroll to the very bottom – this triggers lazy loading on modern Cookidoo pages
         brw.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(SCROLL_TO)
-        # clicking on the "load more recipes" button
+
+        # some regional pages still expose an explicit "Load more recipes" button.
+        # the selector switched from id="load-more-page" to data-cy="load-more-button".
         try:
-            brw.find_element(By.ID, 'load-more-page').click()
-            time.sleep(PAGELOAD_TO)
-        except: pass
-        print('Scrolling [{}/{}]'.format(currentElements, elementsToBeFound))
-        # checking if I can't load more elements
-        count = count + 1 if previousElements == currentElements else 0
-        if count >= MAX_SCROLL_RETRIES: break
+            load_more_btn = brw.find_element(By.CSS_SELECTOR, 'button[data-cy="load-more-button"]')
+            if load_more_btn.is_displayed():
+                # Scroll the button into view – sometimes it sits just below the fold
+                try:
+                    brw.execute_script("arguments[0].scrollIntoView({block: 'center'});", load_more_btn)
+                except Exception:
+                    pass  # ignore if scroll fails – click may still work
+
+                # Use JS click for higher success rate (native click may be intercepted)
+                try:
+                    brw.execute_script("arguments[0].click();", load_more_btn)
+                except Exception:
+                    # Fallback to the traditional Selenium click
+                    try:
+                        load_more_btn.click()
+                    except Exception:
+                        pass  # give up – will retry on next loop
+
+                time.sleep(PAGELOAD_TO)
+        except Exception:
+            # fallback to the legacy id-based selector (older deployments)
+            try:
+                brw.find_element(By.ID, 'load-more-page').click()
+                time.sleep(PAGELOAD_TO)
+            except Exception:
+                pass  # nothing to click – rely on infinite scroll only
+
+        print('Scrolling [{}/{}]'.format(currentElements, "∞" if elementsToBeFound == 10**9 else elementsToBeFound))
+
+        # stop if no new tiles were injected for MAX_SCROLL_RETRIES consecutive rounds
+        retry_counter = retry_counter + 1 if previousElements == currentElements else 0
+        if retry_counter >= MAX_SCROLL_RETRIES:
+            break
+
         previousElements = currentElements
 
-    print('Scrolling [{}/{}]'.format(currentElements, elementsToBeFound))
+    print('Scrolling completed. Total tiles found: {}'.format(previousElements))
 
     # saving all recipes urls
     els = brw.find_elements(By.CLASS_NAME, 'link--alt')
@@ -162,6 +219,71 @@ def run(webdriverfile, outputdir, separate_json):
     # filter recipe Url list because it contains terms-of-use, privacy, disclaimer links too
     recipesURLs = [l for l in recipesURLs if 'recipe' in l]
 
+    # --------------------------------------------------------------
+    # Always attempt explicit page navigation to capture recipes that
+    # infinite-scroll/Load-more may have skipped. We stop when visiting
+    # a page yields no new recipe links for two consecutive pages.
+    # --------------------------------------------------------------
+    print("[CD] Starting explicit page-by-page navigation to ensure completeness…")
+
+    consecutive_empty_pages = 0
+    # Use whatever URL is currently in the browser (this includes any
+    # filter parameters the user might have applied) as the base.
+    base_search_url = brw.current_url.split('#')[0]  # strip hash if any
+
+    # If a &page= already exists, remove it so we can append our own.
+    import re as _re_clean
+    base_search_url = _re_clean.sub(r'[&?]page=\d+', '', base_search_url)
+
+    # Ensure there is a query delimiter before appending new params
+    qry_delim = '&' if '?' in base_search_url else '?'
+
+    page_num = 2  # we already handled the first page above
+
+    while consecutive_empty_pages < 2:
+        page_url = f"{base_search_url}{qry_delim}page={page_num}"
+        print(f"[CD] Navigating to search page {page_num}: {page_url}")
+
+        brw.get(page_url)
+        time.sleep(PAGELOAD_TO)
+
+        # trigger lazy loading on this explicit page as well
+        previous_height = 0
+        scroll_retries = 0
+        while True:
+            brw.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(SCROLL_TO)
+            curr_height = brw.execute_script("return document.body.scrollHeight")
+            if curr_height == previous_height:
+                scroll_retries += 1
+                if scroll_retries >= MAX_SCROLL_RETRIES:
+                    break
+            else:
+                scroll_retries = 0
+            previous_height = curr_height
+
+        # collect recipe links on this page
+        page_els = brw.find_elements(By.CLASS_NAME, 'link--alt')
+        new_links = 0
+        for el in page_els:
+            recipeURL = el.get_attribute('href')
+            if recipeURL and 'recipe' in recipeURL and recipeURL not in recipesURLs:
+                recipesURLs.append(recipeURL)
+                new_links += 1
+
+        print(f"[CD] Added {new_links} new recipes on page {page_num}. Total so far: {len(recipesURLs)}")
+
+        if new_links == 0:
+            consecutive_empty_pages += 1
+        else:
+            consecutive_empty_pages = 0
+
+        page_num += 1
+
+    # --------------------------------------------------------------
+    print(f"[CD] Finished pagination. Total unique recipes collected: {len(recipesURLs)}")
+    # --------------------------------------------------------------
+    
     # getting all recipes
     print("Getting all recipes...")
     c = 0
@@ -209,7 +331,9 @@ def run(webdriverfile, outputdir, separate_json):
         with open('{}data.json'.format(outputdir), 'w') as outfile: json.dump(recipeData, outfile)
 
     # logging out
-    logoutURL = 'https://cookidoo.{}/profile/logout'.format(locale)
+    logoutURL = f"{rootURL}/profile/logout"
+    if language_code:
+        logoutURL += f"/{language_code}"
     brw.get(logoutURL)
     time.sleep(PAGELOAD_TO)
 
